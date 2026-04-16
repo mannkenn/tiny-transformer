@@ -1,6 +1,9 @@
 import torch
+import csv
+import os
 from model import Transformer
 
+LOG_PATH = "logs/train_log.csv"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 batch_size = 64
 block_size = 64
@@ -50,12 +53,31 @@ def estimate_loss(model, train_data, val_data):
     model.train()
     return out
 
+# logging
+def ensure_log_file(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if not os.path.exists(path):
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "step",
+                "train_loss",
+                "val_loss",
+                "lr"
+            ])
+
+def append_log(path, row):
+    with open(path, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(row)
 
 def train():
     torch.manual_seed(1337)
-
+    
+    # load data
     train_data, val_data, vocab_size = load_data()
 
+    # init model
     model = Transformer(
         vocab_size=vocab_size,
         block_size=block_size,
@@ -66,15 +88,26 @@ def train():
     ).to(device)
 
     print(f"parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
-
+    
+    # adam optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
+    ensure_log_file(LOG_PATH)
+
     for step in range(max_iters):
+        # Evaluate periodically and log both to stdout and CSV.
         if step % eval_interval == 0 or step == max_iters - 1:
             losses = estimate_loss(model, train_data, val_data)
             print(
                 f"step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
             )
+
+            append_log(LOG_PATH, [
+                step,
+                losses['train'],
+                losses['val'],
+                learning_rate
+            ])
 
         xb, yb = get_batch("train", train_data, val_data)
         _, loss = model(xb, yb)
