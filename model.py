@@ -110,12 +110,12 @@ class Transformer(nn.Module):
         self.ln_f = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
-    def forward(self, idx targets=None):
+    def forward(self, idx, targets=None):
         B, T = idx.shape
 
         # idx and targets are both (B,T) tensor of integers
-        tok_emb = self.token_embedding_table(idx) # (B,T,C)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
+        tok_emb = self.src_tok_emb(idx) # (B,T,C)
+        pos_emb = self.pos_emb(torch.arange(T, device=idx.device)) # (T,C)
         x = tok_emb + pos_emb # (B,T,C)
 
         for block in self.decoder_blocks:
@@ -129,7 +129,6 @@ class Transformer(nn.Module):
             loss = F.cross_entropy(
                 logits.reshape(Bt * Tt, C),
                 targets.reshape(Bt * Tt),
-                ignore_index=self.pad_id,
             )
 
         return logits, loss
