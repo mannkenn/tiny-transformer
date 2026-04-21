@@ -5,6 +5,7 @@ import csv
 import os
 import yaml
 import argparse
+import shutil
 from datetime import datetime
 from model import Transformer
 
@@ -31,17 +32,28 @@ def parse_config(cfg):
         "max_iters": int(cfg["max_iters"]),
     }
 
-# parse command line arguments for run_name and config file
+# parse command line arguments for run_name, config file and optional checkpoint to resume from
 parser = argparse.ArgumentParser()
 parser.add_argument("--config", type=str, required=True)
+parser.add_argument("--resume", type=str, default=None)
 args = parser.parse_args()
 
 cfg = load_config(f"configs/{args.config}.yaml")
 cfg = parse_config(cfg)
 print(cfg)
 
+# create run id and output directory for this run
 run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-LOG_PATH = f"logs/train_log_{cfg['run_name']}.csv"
+OUT_DIR = f"outputs/{cfg['run_name']}_{run_id}"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# save config used
+shutil.copy(
+    f"configs/{args.config}.yaml",
+    f"{OUT_DIR}/config.yaml"
+)
+
+LOG_PATH = f"{OUT_DIR}/train_log.csv"
 
 def load_data(path="input.txt"):
     with open(path, "r", encoding="utf-8") as f:
@@ -60,14 +72,12 @@ def load_data(path="input.txt"):
 
     return train_data, val_data, len(chars)
 
-
 def get_batch(split, train_data, val_data):
     source = train_data if split == "train" else val_data
     ix = torch.randint(len(source) - cfg["block_size"], (cfg["batch_size"],))
     x = torch.stack([source[i : i + cfg["block_size"]] for i in ix])
     y = torch.stack([source[i + 1 : i + cfg["block_size"] + 1] for i in ix])
     return x.to(device), y.to(device)
-
 
 @torch.no_grad()
 def estimate_loss(model, train_data, val_data):
@@ -103,6 +113,29 @@ def append_log(path, row):
         writer = csv.writer(f)
         writer.writerow(row)
 
+# model checkpointing
+def save_checkpoint(path, model, optimizer, step, best_val_loss, cfg):
+    checkpoint = {
+        "step": step,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "best_val_loss": best_val_loss,
+        "config": cfg,
+    }
+    torch.save(checkpoint, path)
+
+def load_checkpoint(path, model, optimizer=None, map_location=device):
+    checkpoint = torch.load(path, map_location=map_location)
+    model.load_state_dict(checkpoint["model_state_dict"])
+
+    if optimizer is not None:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+    step = checkpoint["step"]
+    best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+    cfg = checkpoint.get("config", None)
+
+    return step, best_val_loss, cfg
 def train():
     torch.manual_seed(1337)
     
@@ -124,11 +157,22 @@ def train():
     # adam optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["learning_rate"])
 
-    ensure_log_file(LOG_PATH)
+    # best loss tracking
+    best_val_loss = float("inf")
 
+    # resume from checkpoint if specified
+    start_step = 0
+    if args.resume is not None:
+        start_step, best_val_loss, _ = load_checkpoint(args.resume, model, optimizer)
+        print(f"resumed from {args.resume} at step {start_step}")
+    
+    # ensure log file exists
+    ensure_log_file(LOG_PATH)
+    
+    # rolling average of step time and tokens processed for logging tokens/sec
     step_times = deque(maxlen=20)
     step_tokens = deque(maxlen=20)
-    for step in range(cfg["max_iters"]):
+    for step in range(start_step, cfg["max_iters"]):
         step_start = time.time()
 
         B, T  = cfg["batch_size"], cfg["block_size"]
@@ -149,6 +193,19 @@ def train():
         # Evaluate periodically and log both to stdout and CSV.
         if step % cfg["eval_interval"] == 0 or step == cfg["max_iters"] - 1:
             losses = estimate_loss(model, train_data, val_data)
+
+            # if this is the best model so far, save a checkpoint
+            if losses["val"] < best_val_loss:
+                best_val_loss = losses["val"]
+                save_checkpoint(
+                    f"{OUT_DIR}/best.pt",
+                    model,
+                    optimizer,
+                    step,
+                    best_val_loss,
+                    cfg,
+                )
+
             print(
                 f"step {step}: train loss {losses['train']:.4f} | val loss {losses['val']:.4f} | step time {step_time:.4f} | tokens/sec {rolling_tokens_per_sec:.4f}"
             )
@@ -161,6 +218,15 @@ def train():
                 f"{step_time:.4f}", # step time
                 f"{rolling_tokens_per_sec:.4f}" # tokens/sec
             ])
+
+            save_checkpoint(
+                f"{OUT_DIR}/latest.pt",
+                model,
+                optimizer,
+                step,
+                best_val_loss,
+                cfg,
+            )
 
 if __name__ == "__main__":
     train()
