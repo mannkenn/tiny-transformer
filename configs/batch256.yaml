@@ -1,0 +1,11 @@
+run_name: batch256
+n_layers: 6
+n_heads: 6
+dropout: 0.1
+block_size: 256
+n_embd: 384
+batch_size: 256
+learning_rate: 3e-4
+eval_interval: 500
+eval_iters: 200
+max_iters: 5000
