@@ -30,6 +30,7 @@ def parse_config(cfg):
         "eval_interval": int(cfg["eval_interval"]),
         "eval_iters": int(cfg["eval_iters"]),
         "max_iters": int(cfg["max_iters"]),
+        "grad_accum_steps": int(cfg.get("grad_accum_steps", 1)), # optional grad accum
     }
 
 # parse command line arguments for run_name, config file and optional checkpoint to resume from
@@ -136,6 +137,7 @@ def load_checkpoint(path, model, optimizer=None, map_location=device):
     cfg = checkpoint.get("config", None)
 
     return step, best_val_loss, cfg
+
 def train():
     torch.manual_seed(1337)
     
@@ -151,6 +153,8 @@ def train():
         n_heads=cfg["n_heads"],
         dropout=cfg["dropout"],
     ).to(device)
+
+    torch.cuda.reset_peak_memory_stats()
 
     print(f"parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
     
@@ -168,35 +172,49 @@ def train():
     
     # ensure log file exists
     ensure_log_file(LOG_PATH)
+
+    # grad accum 
+    grad_accum_steps = cfg["grad_accum_steps"]
     
     # rolling average of step time and tokens processed for logging tokens/sec
     step_times = deque(maxlen=20)
     step_tokens = deque(maxlen=20)
+
     for step in range(start_step, cfg["max_iters"]):
+        total_loss = 0.0
+        
         step_start = time.time()
 
         B, T  = cfg["batch_size"], cfg["block_size"]
         tokens = B * T
 
-        xb, yb = get_batch("train", train_data, val_data)
-        logits, loss = model(xb, yb)
-
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        
+        for micro_step in range(grad_accum_steps):
+            xb, yb = get_batch("train", train_data, val_data)
+            logits, loss = model(xb, yb)
+            total_loss += loss.item()
+            loss = loss / grad_accum_steps
+            loss.backward()
+
         optimizer.step()
 
         step_time = time.time() - step_start
         step_times.append(step_time)
         step_tokens.append(tokens)
         rolling_tokens_per_sec = sum(step_tokens) / sum(step_times) # rolling tokens/sec over last 20 steps
+        
+        # Compute average training loss from accumulated gradients
+        avg_train_loss = total_loss / grad_accum_steps
 
         # Evaluate periodically and log both to stdout and CSV.
         if step % cfg["eval_interval"] == 0 or step == cfg["max_iters"] - 1:
             losses = estimate_loss(model, train_data, val_data)
+            val_loss = losses["val"]
 
             # if this is the best model so far, save a checkpoint
-            if losses["val"] < best_val_loss:
-                best_val_loss = losses["val"]
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
                 save_checkpoint(
                     f"{OUT_DIR}/best.pt",
                     model,
@@ -207,16 +225,24 @@ def train():
                 )
 
             print(
-                f"step {step}: train loss {losses['train']:.4f} | val loss {losses['val']:.4f} | step time {step_time:.4f} | tokens/sec {rolling_tokens_per_sec:.4f}"
+                f"step {step}: train loss {avg_train_loss:.4f} | val loss {val_loss:.4f} | step time {step_time:.4f} | tokens/sec {rolling_tokens_per_sec:.4f}"
             )
+
+            # memory usage
+            allocated = torch.cuda.memory_allocated() / 1e9  # in GB
+            reserved = torch.cuda.memory_reserved() / 1e9    # in GB
+            max_allocated = torch.cuda.max_memory_allocated() / 1e9  # peak so far
 
             append_log(LOG_PATH, [
                 step,
-                f"{losses['train']:.4f}",
-                f"{losses['val']:.4f}",
+                f"{avg_train_loss:.4f}",
+                f"{val_loss:.4f}",
                 f"{cfg['learning_rate']:.4f}",
                 f"{step_time:.4f}", # step time
-                f"{rolling_tokens_per_sec:.4f}" # tokens/sec
+                f"{rolling_tokens_per_sec:.4f}", # tokens/sec
+                f"{allocated:.4f}", # allocated memory
+                f"{reserved:.4f}", # reserved memory
+                f"{max_allocated:.4f}", # max allocated memory
             ])
 
             save_checkpoint(
