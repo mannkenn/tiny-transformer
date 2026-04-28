@@ -100,14 +100,21 @@ def ensure_log_file(path):
     if not os.path.exists(path):
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([
+            headers = [
                 "step",
                 "train_loss",
                 "val_loss",
                 "lr",
                 "elapsed_time",
                 "tokens_per_sec"
-            ])
+            ]
+            if torch.cuda.is_available():
+                headers.extend([
+                    "allocated_memory_gb",
+                    "reserved_memory_gb",
+                    "max_allocated_memory_gb"
+                ])
+            writer.writerow(headers)
 
 def append_log(path, row):
     with open(path, "a", newline="") as f:
@@ -154,7 +161,8 @@ def train():
         dropout=cfg["dropout"],
     ).to(device)
 
-    torch.cuda.reset_peak_memory_stats()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
 
     print(f"parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
     
@@ -228,22 +236,27 @@ def train():
                 f"step {step}: train loss {avg_train_loss:.4f} | val loss {val_loss:.4f} | step time {step_time:.4f} | tokens/sec {rolling_tokens_per_sec:.4f}"
             )
 
-            # memory usage
-            allocated = torch.cuda.memory_allocated() / 1e9  # in GB
-            reserved = torch.cuda.memory_reserved() / 1e9    # in GB
-            max_allocated = torch.cuda.max_memory_allocated() / 1e9  # peak so far
-
-            append_log(LOG_PATH, [
+            # memory usage (only for CUDA)
+            log_row = [
                 step,
                 f"{avg_train_loss:.4f}",
                 f"{val_loss:.4f}",
                 f"{cfg['learning_rate']:.4f}",
                 f"{step_time:.4f}", # step time
                 f"{rolling_tokens_per_sec:.4f}", # tokens/sec
-                f"{allocated:.4f}", # allocated memory
-                f"{reserved:.4f}", # reserved memory
-                f"{max_allocated:.4f}", # max allocated memory
-            ])
+            ]
+            
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1e9  # in GB
+                reserved = torch.cuda.memory_reserved() / 1e9    # in GB
+                max_allocated = torch.cuda.max_memory_allocated() / 1e9  # peak so far
+                log_row.extend([
+                    f"{allocated:.4f}",  # allocated memory
+                    f"{reserved:.4f}",   # reserved memory
+                    f"{max_allocated:.4f}",  # max allocated memory
+                ])
+
+            append_log(LOG_PATH, log_row)
 
             save_checkpoint(
                 f"{OUT_DIR}/latest.pt",
