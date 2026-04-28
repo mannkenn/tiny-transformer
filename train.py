@@ -104,15 +104,15 @@ def ensure_log_file(path):
                 "step",
                 "train_loss",
                 "val_loss",
-                "lr",
-                "elapsed_time",
+                "learning_rate",
+                "step_time",
                 "tokens_per_sec"
             ]
             if torch.cuda.is_available():
                 headers.extend([
-                    "allocated_memory_gb",
-                    "reserved_memory_gb",
-                    "max_allocated_memory_gb"
+                    "allocated_gb",
+                    "reserved_gb",
+                    "max_allocated_gb"
                 ])
             writer.writerow(headers)
 
