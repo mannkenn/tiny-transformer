@@ -56,6 +56,16 @@ shutil.copy(
 
 LOG_PATH = f"{OUT_DIR}/train_log.csv"
 
+# mixed precision
+use_amp = cfg.get("mixed_precision", False) and torch.cuda.is_available()
+
+dtype_map = {
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+}
+
+amp_dtype = dtype_map.get(cfg.get("dtype", "bf16"), torch.bfloat16)
+
 def load_data(path="input.txt"):
     with open(path, "r", encoding="utf-8") as f:
         text = f.read()
@@ -200,9 +210,12 @@ def train():
         
         for micro_step in range(grad_accum_steps):
             xb, yb = get_batch("train", train_data, val_data)
-            logits, loss = model(xb, yb)
-            total_loss += loss.item()
-            loss = loss / grad_accum_steps
+            
+            with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
+                logits, loss = model(xb, yb)
+                total_loss += loss.item()
+                loss = loss / grad_accum_steps
+            
             loss.backward()
 
         optimizer.step()
