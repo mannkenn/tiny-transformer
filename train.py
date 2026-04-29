@@ -194,7 +194,7 @@ def train():
         step_start = time.time()
 
         B, T  = cfg["batch_size"], cfg["block_size"]
-        tokens = B * T
+        tokens = B * T * grad_accum_steps # total tokens processed in this step (accounting for grad accum)
 
         optimizer.zero_grad(set_to_none=True)
         
