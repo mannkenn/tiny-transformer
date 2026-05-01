@@ -1,16 +1,17 @@
 #!/bin/bash
 
+set -e
+
 mkdir -p logs outputs
 
-for cfg in configs/*.yaml configs/*/*.yaml; do
-  name=$(basename "$cfg" .yaml)
+for cfg in $(find configs -name "*.yaml" | sort); do
+  name=$(echo "$cfg" | sed 's|configs/||; s|\.yaml$||; s|/|_|g')
 
   echo "=============================="
-  echo "Running $name"
+  echo "Running $cfg"
+  echo "Log: logs/${name}.log"
   echo "=============================="
 
   python train.py --config "$cfg" \
-    --run_name "$name" \
     2>&1 | tee "logs/${name}.log"
-
 done
