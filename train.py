@@ -5,6 +5,7 @@ import csv
 import os
 import argparse
 import shutil
+import math
 from datetime import datetime
 from model import Transformer
 from utils import load_config, parse_config
@@ -17,32 +18,42 @@ parser.add_argument("--config", type=str, required=True)
 parser.add_argument("--resume", type=str, default=None)
 args = parser.parse_args()
 
-cfg = load_config(f"configs/{args.config}.yaml")
-cfg = parse_config(cfg)
-print(cfg)
-
-# create run id and output directory for this run
-run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-OUT_DIR = f"outputs/{cfg['run_name']}_{run_id}"
-os.makedirs(OUT_DIR, exist_ok=True)
-
-# save config used
-shutil.copy(
-    f"configs/{args.config}.yaml",
-    f"{OUT_DIR}/config.yaml"
-)
-
-LOG_PATH = f"{OUT_DIR}/train_log.csv"
-
-# mixed precision
-use_amp = cfg.get("mixed_precision", False) and torch.cuda.is_available()
+# globals that will be set per-config run
+cfg = None
+OUT_DIR = None
+LOG_PATH = None
+use_amp = False
+amp_dtype = torch.bfloat16
 
 dtype_map = {
     "fp16": torch.float16,
     "bf16": torch.bfloat16,
 }
 
-amp_dtype = dtype_map.get(cfg.get("dtype", "bf16"), torch.bfloat16)
+def prepare_run_from_file(config_path):
+    """Load and prepare globals for a single config file path."""
+    global cfg, OUT_DIR, LOG_PATH, use_amp, amp_dtype
+
+    raw = load_config(config_path)
+    cfg = parse_config(raw)
+    print(cfg)
+
+    # create run id and output directory for this run
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # include config filename to distinguish runs from the same run_name
+    cfg_name = os.path.splitext(os.path.basename(config_path))[0]
+    OUT_DIR = f"outputs/{cfg['run_name']}_{cfg_name}_{run_id}"
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    # save config used
+    shutil.copy(config_path, f"{OUT_DIR}/config.yaml")
+
+    LOG_PATH = f"{OUT_DIR}/train_log.csv"
+
+    # mixed precision
+    use_amp = cfg.get("mixed_precision", False) and torch.cuda.is_available()
+
+    amp_dtype = dtype_map.get(cfg.get("dtype", "bf16"), torch.bfloat16)
 
 def load_data(path="input.txt"):
     with open(path, "r", encoding="utf-8") as f:
@@ -133,6 +144,21 @@ def load_checkpoint(path, model, optimizer=None, map_location=device):
 
     return step, best_val_loss, cfg
 
+def get_lr(step, max_lr, min_lr, warmup_steps, max_iters):
+    # linear warmup
+    if step < warmup_steps:
+        return max_lr * (step + 1) / warmup_steps
+
+    # 2. after training ends, stay at min_lr
+    if step >= max_iters:
+        return min_lr
+
+    # 3. cosine decay
+    decay_ratio = (step - warmup_steps) / (max_iters - warmup_steps)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+
+    return min_lr + coeff * (max_lr - min_lr)
+
 def train():
     torch.manual_seed(1337)
     
@@ -183,8 +209,23 @@ def train():
     step_tokens = deque(maxlen=20)
 
     for step in range(start_step, cfg["max_iters"]):
+
+        # lr scheduling
+        if cfg["use_lr_scheduler"]:
+            lr = get_lr(
+                step,
+                max_lr=cfg["learning_rate"],
+                min_lr=cfg["min_lr"],
+                warmup_steps=cfg["warmup_steps"],
+                max_iters=cfg["max_iters"],
+            )
+
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
+        else:
+            lr = cfg["learning_rate"]
+
         total_loss = 0.0
-        
         step_start = time.time()
 
         B, T  = cfg["batch_size"], cfg["block_size"]
@@ -192,7 +233,7 @@ def train():
 
         optimizer.zero_grad(set_to_none=True)
         
-        for micro_step in range(grad_accum_steps):
+        for micro_step in range(grad_accum_steps): # accum gradient over steps
             xb, yb = get_batch("train", train_data, val_data)
             
             with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
@@ -233,16 +274,15 @@ def train():
                 f"step {step}: train loss {avg_train_loss:.4f} | val loss {val_loss:.4f} | step time {step_time:.4f} | tokens/sec {rolling_tokens_per_sec:.4f}"
             )
 
-            # memory usage (only for CUDA)
             log_row = [
                 step,
                 f"{avg_train_loss:.4f}",
                 f"{val_loss:.4f}",
-                f"{cfg['learning_rate']:.4f}",
+                f"{lr:.4f}",
                 f"{step_time:.4f}", # step time
                 f"{rolling_tokens_per_sec:.4f}", # tokens/sec
             ]
-            
+            # memory usage (only for CUDA)
             if torch.cuda.is_available():
                 allocated = torch.cuda.memory_allocated() / 1e9  # in GB
                 reserved = torch.cuda.memory_reserved() / 1e9    # in GB
@@ -265,4 +305,27 @@ def train():
             )
 
 if __name__ == "__main__":
-    train()
+    # allow --config to be either a single config name (without .yaml),
+    # a path to a single yaml, or a directory under configs/ containing many yaml files.
+    config_arg = args.config
+    config_path_candidate = f"configs/{config_arg}"
+    config_file_candidate = f"{config_path_candidate}.yaml"
+
+    config_files = []
+    if os.path.isdir(config_path_candidate):
+        # collect all .yaml files in the directory
+        for fn in sorted(os.listdir(config_path_candidate)):
+            if fn.endswith(".yaml") or fn.endswith(".yml"):
+                config_files.append(os.path.join(config_path_candidate, fn))
+    elif os.path.isfile(config_file_candidate):
+        config_files = [config_file_candidate]
+    elif os.path.isfile(config_arg):
+        # user supplied a direct path
+        config_files = [config_arg]
+    else:
+        raise FileNotFoundError(f"Could not find config file or directory for '{config_arg}'")
+
+    for cfg_file in config_files:
+        print(f"Running config: {cfg_file}")
+        prepare_run_from_file(cfg_file)
+        train()

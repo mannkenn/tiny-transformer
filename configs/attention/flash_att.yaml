@@ -1,4 +1,4 @@
-run_name: baseline
+run_name: flash_att
 n_layers: 6
 n_heads: 6
 dropout: 0.1

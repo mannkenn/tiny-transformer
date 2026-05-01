@@ -1,11 +1,9 @@
 import yaml
 
-
 def load_config(path: str):
 	with open(path, "r") as f:
 		cfg = yaml.safe_load(f)
 	return cfg
-
 
 def parse_config(cfg):
 	# cast config values to correct types
@@ -23,4 +21,7 @@ def parse_config(cfg):
 		"max_iters": int(cfg["max_iters"]),
 		"grad_accum_steps": int(cfg.get("grad_accum_steps", 1)),
 		"use_flash_attention": bool(cfg.get("use_flash_attention", True)),
+		"min_lr": float(cfg.get("min_lr", 0)),
+        "warmup_steps": int(cfg.get("warmup_steps", 0)),
+		"use_lr_scheduler": bool(cfg.get("use_lr_scheduler", False))
 	}
