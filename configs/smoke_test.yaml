@@ -9,3 +9,4 @@ learning_rate: 1e-3
 eval_interval: 10
 eval_iters: 5
 max_iters: 50
+use_flash_attention: true

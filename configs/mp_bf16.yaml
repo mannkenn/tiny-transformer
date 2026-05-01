@@ -9,5 +9,6 @@ learning_rate: 3e-4
 eval_interval: 500
 eval_iters: 200
 max_iters: 5000
+use_flash_attention: False
 mixed_precision: True
 dtype: bf16

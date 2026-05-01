@@ -5,12 +5,13 @@ from torch.nn import functional as F
 class Head(nn.Module):
     """General attention head for self-attention and cross-attention."""
 
-    def __init__(self, n_embd, head_size, dropout):
+    def __init__(self, n_embd, head_size, dropout, use_flash_attention=True):
         super().__init__()
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.dropout = nn.Dropout(dropout)
+        self.use_flash_attention = use_flash_attention
 
     def forward(self, query, key, value, is_causal: bool = False):
         # query: (B, Tq, C), key/value: (B, Tk, C)
@@ -18,24 +19,45 @@ class Head(nn.Module):
         k = self.key(key)      # (B, Tk, hs)
         v = self.value(value)  # (B, Tk, hs)
 
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            dropout_p=self.dropout.p,
-            is_causal=is_causal,
-        )  # (B, Tq, hs)
+        if self.use_flash_attention:
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                is_causal=is_causal,
+            )  # (B, Tq, hs)
+        else:
+            scale = q.size(-1) ** -0.5
+            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+
+            if is_causal:
+                q_len, k_len = attn.size(-2), attn.size(-1)
+                causal_mask = torch.triu(
+                    torch.ones(q_len, k_len, device=attn.device, dtype=torch.bool),
+                    diagonal=1,
+                )
+                attn = attn.masked_fill(causal_mask, float("-inf"))
+
+            attn = F.softmax(attn, dim=-1)
+            attn = F.dropout(attn, p=self.dropout.p, training=self.training)
+            out = torch.matmul(attn, v)  # (B, Tq, hs)
         return out
 
 
 class MultiHeadedSelfAttention(nn.Module):
     """Multi-head self-attention."""
 
-    def __init__(self, n_embd, n_heads, dropout):
+    def __init__(self, n_embd, n_heads, dropout, use_flash_attention=True):
         super().__init__()
         assert n_embd % n_heads == 0
 
         self.head_size = n_embd // n_heads
         self.heads = nn.ModuleList(
-            [Head(n_embd, self.head_size, dropout) for _ in range(n_heads)]
+            [
+                Head(n_embd, self.head_size, dropout, use_flash_attention)
+                for _ in range(n_heads)
+            ]
         )
         self.proj = nn.Linear(n_embd, n_embd, bias=False)
         self.dropout = nn.Dropout(dropout)
@@ -60,10 +82,15 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 class DecoderBlock(nn.Module):
-    def __init__(self, n_embd, n_heads, dropout):
+    def __init__(self, n_embd, n_heads, dropout, use_flash_attention=True):
         super().__init__()
 
-        self.mhsa = MultiHeadedSelfAttention(n_embd, n_heads, dropout)
+        self.mhsa = MultiHeadedSelfAttention(
+            n_embd,
+            n_heads,
+            dropout,
+            use_flash_attention,
+        )
         self.ff = FeedForward(n_embd, dropout)
 
         self.ln1 = nn.LayerNorm(n_embd)
@@ -83,6 +110,7 @@ class Transformer(nn.Module):
         n_layers=6,
         n_heads=8,
         dropout=0.1,
+        use_flash_attention=True,
     ):
         super().__init__()
 
@@ -94,7 +122,10 @@ class Transformer(nn.Module):
         self.pos_emb = nn.Embedding(block_size, n_embd)
 
         self.decoder_blocks = nn.ModuleList(
-            [DecoderBlock(n_embd, n_heads, dropout) for _ in range(n_layers)]
+            [
+                DecoderBlock(n_embd, n_heads, dropout, use_flash_attention)
+                for _ in range(n_layers)
+            ]
         )
 
         self.ln_f = nn.LayerNorm(n_embd)
