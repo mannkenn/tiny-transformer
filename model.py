@@ -18,21 +18,11 @@ class Head(nn.Module):
         k = self.key(key)      # (B, Tk, hs)
         v = self.value(value)  # (B, Tk, hs)
 
-        # (B, Tq, hs) @ (B, hs, Tk) -> (B, Tq, Tk)
-        att = q @ k.transpose(-2, -1) / (k.shape[-1] ** 0.5)
-
-        if is_causal:
-            Tq, Tk = att.shape[-2], att.shape[-1]
-            causal_mask = torch.tril(
-                torch.ones(Tq, Tk, device=att.device, dtype=torch.bool)
-            )
-            att = att.masked_fill(~causal_mask, float("-inf"))
-
-        att = F.softmax(att, dim=-1)
-        att = self.dropout(att)
-
-        # (B, Tq, Tk) @ (B, Tk, hs) -> (B, Tq, hs)
-        out = att @ v
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.dropout.p,
+            is_causal=is_causal,
+        )  # (B, Tq, hs)
         return out
 
 
