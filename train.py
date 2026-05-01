@@ -149,6 +149,11 @@ def train():
         dropout=cfg["dropout"],
         use_flash_attention=cfg["use_flash_attention"],
     ).to(device)
+    
+    # torch compile
+    if cfg.get("torch_compile", False):
+        print("compiling model with torch.compile...")
+        model = torch.compile(model)
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
