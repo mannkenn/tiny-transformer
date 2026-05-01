@@ -1,0 +1,12 @@
+run_name: batch128_scaled_lr
+n_layers: 6
+n_heads: 6
+dropout: 0.1
+block_size: 256
+n_embd: 384
+batch_size: 128
+learning_rate: 3e-4 * (128 / 64) # scale learning rate with batch size
+eval_interval: 500
+eval_iters: 200
+max_iters: 5000
+use_flash_attention: False

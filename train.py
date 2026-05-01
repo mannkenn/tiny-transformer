@@ -192,7 +192,7 @@ def train():
 
         optimizer.zero_grad(set_to_none=True)
         
-        for micro_step in range(grad_accum_steps):
+        for micro_step in range(grad_accum_steps): # accum gradient over steps
             xb, yb = get_batch("train", train_data, val_data)
             
             with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
@@ -233,7 +233,6 @@ def train():
                 f"step {step}: train loss {avg_train_loss:.4f} | val loss {val_loss:.4f} | step time {step_time:.4f} | tokens/sec {rolling_tokens_per_sec:.4f}"
             )
 
-            # memory usage (only for CUDA)
             log_row = [
                 step,
                 f"{avg_train_loss:.4f}",
@@ -242,7 +241,7 @@ def train():
                 f"{step_time:.4f}", # step time
                 f"{rolling_tokens_per_sec:.4f}", # tokens/sec
             ]
-            
+            # memory usage (only for CUDA)
             if torch.cuda.is_available():
                 allocated = torch.cuda.memory_allocated() / 1e9  # in GB
                 reserved = torch.cuda.memory_reserved() / 1e9    # in GB
