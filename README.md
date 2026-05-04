@@ -26,6 +26,6 @@ rather than scaling out across multiple devices, this work investigates how far 
 | Gradient accumulation over 4 steps | grad accum | 16 | 4 | 64 | fp32 | no | 124k | 0.1363 | 1.068 | 1.6227 |
 | Gradient accumulation over 2 steps | grad accum | 32 | 2 | 64 | fp32 | no | 245k | 0.0678 | 1.944 | 1.6044 |
 | BF16 Mixed Precision| bf16 mp | 64 | 1 | 64 | bf16 | no | 291k | 0.0558 | 3.6 | 1.6111 |
-| Flash Attention | 64 | 1 | 64 | fp32 | no | 293k | 0.057 | 3.597 | 1.6112 |
-| torch.compile | 64 | 1 | 64 | fp32 | yes | 291k | 0.0551 | 3.6 | 1.6111 |
+| Flash Attention | Flash attention 2| 64 | 1 | 64 | fp32 | no | 293k | 0.057 | 3.597 | 1.6112 |
+| torch.compile | torch compile for kernel fusion | 64 | 1 | 64 | fp32 | yes | 291k | 0.0551 | 3.6 | 1.6111 |
 
