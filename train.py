@@ -201,10 +201,8 @@ def train():
     # ensure log file exists
     ensure_log_file(LOG_PATH)
 
-    # grad accum 
     grad_accum_steps = cfg["grad_accum_steps"]
-    
-    # rolling average of step time and tokens processed for logging tokens/sec
+    print(f"effective batch size: {cfg['batch_size'] * grad_accum_steps}")
     step_times = deque(maxlen=20)
     step_tokens = deque(maxlen=20)
 
