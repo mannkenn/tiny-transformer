@@ -5,7 +5,7 @@ dropout: 0.1
 block_size: 256
 n_embd: 384
 batch_size: 128
-learning_rate: 3e-4 * (128 / 64) # scale learning rate with batch size
+learning_rate: 6.0e-4  # 3e-4 * (128 / 64), linear LR scaling with batch size
 eval_interval: 500
 eval_iters: 200
 max_iters: 5000

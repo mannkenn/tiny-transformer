@@ -117,8 +117,7 @@ class Transformer(nn.Module):
         self.block_size = block_size
         self.n_embd = n_embd
 
-        self.src_tok_emb = nn.Embedding(vocab_size, n_embd)
-        self.tgt_tok_emb = nn.Embedding(vocab_size, n_embd)
+        self.tok_emb = nn.Embedding(vocab_size, n_embd)
         self.pos_emb = nn.Embedding(block_size, n_embd)
 
         self.decoder_blocks = nn.ModuleList(
@@ -135,7 +134,7 @@ class Transformer(nn.Module):
         B, T = idx.shape
 
         # idx and targets are both (B,T) tensor of integers
-        tok_emb = self.src_tok_emb(idx) # (B,T,C)
+        tok_emb = self.tok_emb(idx)  # (B,T,C)
         pos_emb = self.pos_emb(torch.arange(T, device=idx.device)) # (T,C)
         x = tok_emb + pos_emb # (B,T,C)
 
