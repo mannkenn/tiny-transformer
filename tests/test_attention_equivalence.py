@@ -15,9 +15,9 @@ deterministic one.
 
 import pytest
 import torch
+from reference_attention import LoopedMultiHeadedSelfAttention, copy_weights_to_fused
 
 from model import MultiHeadedSelfAttention
-from reference_attention import LoopedMultiHeadedSelfAttention, copy_weights_to_fused
 
 TOLERANCE = 1e-5
 

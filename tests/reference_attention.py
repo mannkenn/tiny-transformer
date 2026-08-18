@@ -108,3 +108,19 @@ def copy_weights_to_fused(looped, fused):
         fused.proj.weight.copy_(looped.proj.weight)
 
     assert n_heads * head_size == n_embd
+
+
+def copy_weights_to_looped(fused, looped):
+    """Inverse of :func:`copy_weights_to_fused`, for end-to-end parity checks."""
+    head_size = looped.head_size
+    n_embd = fused.n_embd
+
+    with torch.no_grad():
+        for i, head in enumerate(looped.heads):
+            start, stop = i * head_size, (i + 1) * head_size
+            head.query.weight.copy_(fused.qkv.weight[start:stop])
+            head.key.weight.copy_(fused.qkv.weight[n_embd + start : n_embd + stop])
+            head.value.weight.copy_(
+                fused.qkv.weight[2 * n_embd + start : 2 * n_embd + stop]
+            )
+        looped.proj.weight.copy_(fused.proj.weight)
