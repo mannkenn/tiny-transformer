@@ -1,10 +1,19 @@
+import argparse
 import glob
+import json
 from pathlib import Path
 
 import pandas as pd
 import yaml
 
 from utils import parse_config
+
+# Older runs used different column names. Keep reading them rather than
+# stranding the only surviving pre-refactor CSV.
+LEGACY_COLUMNS = {
+    "lr": "learning_rate",
+    "elapsed_time": "step_time",
+}
 
 BASELINE = {
     "batch_size": 64,
@@ -86,10 +95,26 @@ def load_run_config(csv_path):
     if not config_path.exists():
         return None
 
-    with open(config_path, "r") as f:
+    with open(config_path) as f:
         raw = yaml.safe_load(f)
 
     return parse_config(raw)
+
+
+def load_run_info(csv_path):
+    """Read the hardware/software provenance written alongside a run."""
+    info_path = csv_path.parent / "run_info.json"
+    if not info_path.exists():
+        return None
+    with open(info_path) as f:
+        return json.load(f)
+
+
+def device_label(info):
+    """Never guess. A run with no recorded device is reported as unknown."""
+    if info is None:
+        return "unrecorded"
+    return info.get("device_name") or info.get("device_type") or "unrecorded"
 
 
 def describe_change(cfg):
@@ -136,6 +161,7 @@ def precision_label(cfg):
 def summarize_run(csv_path):
     csv_path = Path(csv_path)
     df = pd.read_csv(csv_path)
+    df = df.rename(columns={k: v for k, v in LEGACY_COLUMNS.items() if k in df.columns})
 
     numeric_cols = [
         "step",
@@ -157,13 +183,21 @@ def summarize_run(csv_path):
     steady_df = df[df["step"] > 0] if "step" in df.columns else df
     final_row = df.iloc[-1]
     cfg = load_run_config(csv_path)
+    info = load_run_info(csv_path)
 
     run_name = cfg["run_name"] if cfg else csv_path.parent.name
+
+    # Validation loss at the last step is not the same thing as the best the run
+    # ever reached. On this corpus the model overfits well before the final
+    # step, so reporting only the final value ranks runs by how far past their
+    # optimum they went.
+    best_idx = df["val_loss"].idxmin()
 
     return {
         "run_name": run_name,
         "Run Name": run_name.replace("_", " ").title(),
         "Change": describe_change(cfg),
+        "Device": device_label(info),
         "Batch": cfg["batch_size"] if cfg else "",
         "Grad Accum": cfg["grad_accum_steps"] if cfg else "",
         "Eff Batch": cfg["effective_batch_size"] if cfg else "",
@@ -174,7 +208,9 @@ def summarize_run(csv_path):
         "Max Mem (GB)": round(df["max_allocated_gb"].max(), 3)
         if "max_allocated_gb" in df.columns
         else "",
-        "Val Loss": round(final_row["val_loss"], 4),
+        "Final Val Loss": round(final_row["val_loss"], 4),
+        "Best Val Loss": round(df.loc[best_idx, "val_loss"], 4),
+        "Best @ Step": int(df.loc[best_idx, "step"]),
         "category": CATEGORY_MAP.get(run_name, "Other"),
         "_sort_key": RUN_ORDER.get(run_name, 99),
         "_tokens_per_sec_raw": steady_df["tokens_per_sec"].mean(),
@@ -195,31 +231,46 @@ def build_findings(rows):
         return delta
 
     if baseline:
+        # Memory is only instrumented on CUDA; say so rather than printing "** GB**".
+        mem = baseline["Max Mem (GB)"]
+        mem_line = (
+            f"- Memory: **{mem} GB** peak allocated.\n"
+            if mem not in ("", None) and not pd.isna(mem)
+            else "- Memory: not recorded (only instrumented on CUDA).\n"
+        )
         sections.append(
             "### Baseline\n"
+            f"- Device: **{baseline['Device']}**.\n"
             f"- Throughput: **{baseline['Tokens/sec']} tokens/sec** at batch 64, fp32, manual attention.\n"
-            f"- Memory: **{baseline['Max Mem (GB)']} GB** peak allocated.\n"
-            f"- Validation loss after 5k steps: **{baseline['Val Loss']}**."
+            f"{mem_line}"
+            f"- Validation loss: **{baseline['Best Val Loss']}** at step "
+            f"{baseline['Best @ Step']} (best), **{baseline['Final Val Loss']}** at the final step."
         )
 
     batch_runs = [by_name[k] for k in ("batch32", "batch128", "batch256") if k in by_name]
     if batch_runs and baseline:
-        best = min(batch_runs, key=lambda r: r["Val Loss"])
+        best = min(batch_runs, key=lambda r: r["Best Val Loss"])
         fastest = max(batch_runs, key=lambda r: r["_tokens_per_sec_raw"])
         lines = [
             "### Batch size sweep",
-            "- Larger batches increase memory roughly linearly but do not scale throughput proportionally on this model — training appears memory-bandwidth limited.",
+            "- Larger batches increase memory roughly linearly but do not scale throughput "
+            "proportionally. Doubling the batch should roughly double tokens/sec if the GPU "
+            "were compute- or bandwidth-bound; it does not, which points at fixed per-step "
+            "overhead (kernel launches, Python dispatch, the optimizer step) dominating.",
         ]
         for run in batch_runs:
             mem_delta = pct_delta(run["Max Mem (GB)"], baseline["Max Mem (GB)"], higher_is_better=False)
-            loss_delta = pct_delta(run["Val Loss"], baseline["Val Loss"], higher_is_better=False)
+            loss_delta = pct_delta(run["Best Val Loss"], baseline["Best Val Loss"], higher_is_better=False)
             mem_note = f"{mem_delta:+.0f}% memory vs baseline" if mem_delta is not None else "memory n/a"
-            loss_note = f"{loss_delta:+.1f}% val loss vs baseline" if loss_delta is not None else "loss n/a"
+            loss_note = f"{loss_delta:+.1f}% best val loss vs baseline" if loss_delta is not None else "loss n/a"
             lines.append(
-                f"- **{run['Run Name']}**: {run['Tokens/sec']} tok/s, {run['Max Mem (GB)']} GB, val loss {run['Val Loss']} ({mem_note}, {loss_note})."
+                f"- **{run['Run Name']}**: {run['Tokens/sec']} tok/s, {run['Max Mem (GB)']} GB, "
+                f"best val loss {run['Best Val Loss']} @ step {run['Best @ Step']} "
+                f"({mem_note}, {loss_note})."
             )
         lines.append(
-            f"- Best optimization quality in this sweep: **{best['Run Name']}** (val loss {best['Val Loss']}). "
+            f"- Best optimization quality in this sweep: **{best['Run Name']}** "
+            f"(best val loss {best['Best Val Loss']}). "
             f"Fastest among batch variants: **{fastest['Run Name']}** ({fastest['Tokens/sec']} tok/s)."
         )
         sections.append("\n".join(lines))
@@ -233,7 +284,7 @@ def build_findings(rows):
         for run in grad_runs:
             lines.append(
                 f"- **{run['Run Name']}** (eff batch {run['Eff Batch']}): {run['Tokens/sec']} tok/s, "
-                f"{run['Max Mem (GB)']} GB, val loss {run['Val Loss']}."
+                f"{run['Max Mem (GB)']} GB, best val loss {run['Best Val Loss']}."
             )
         best_grad = max(grad_runs, key=lambda r: r["_tokens_per_sec_raw"])
         lines.append(
@@ -245,24 +296,36 @@ def build_findings(rows):
     if mp_run and baseline:
         sections.append(
             "### Mixed precision (BF16)\n"
-            f"- **BF16** matches baseline on throughput ({mp_run['Tokens/sec']}), memory ({mp_run['Max Mem (GB)']} GB), "
-            f"and validation loss ({mp_run['Val Loss']}). On supported GPUs this is effectively a free optimization."
+            f"- **BF16** measured the same as baseline on throughput ({mp_run['Tokens/sec']}), "
+            f"memory ({mp_run['Max Mem (GB)']} GB) and validation loss "
+            f"({mp_run['Best Val Loss']}).\n"
+            "- A null result this exact is itself suspicious: bf16 halves activation "
+            "bytes, so peak memory should have moved even if speed did not. Before "
+            "concluding 'bf16 is free', confirm autocast was actually active in the run."
         )
 
     flash_run = by_name.get("flash_att")
     if flash_run and baseline:
         sections.append(
             "### Flash attention\n"
-            f"- Flash attention yields a negligible throughput change ({flash_run['Tokens/sec']} vs {baseline['Tokens/sec']}) "
-            f"at this model size. Kernel fusion benefits grow with sequence length and head count."
+            f"- Flash attention yields a negligible throughput change "
+            f"({flash_run['Tokens/sec']} vs {baseline['Tokens/sec']}).\n"
+            "- These numbers were measured with the pre-fusion attention, which ran each "
+            "head as a separate SDPA call on a (B, T, head_size) tensor. Fusing kernels "
+            "cannot help when the bottleneck is the number of launches rather than the "
+            "cost of each one, so this result says more about the old implementation than "
+            "about flash attention."
         )
 
     compile_run = by_name.get("torch_compile")
     if compile_run and baseline:
         sections.append(
             "### torch.compile\n"
-            f"- **torch.compile** shows no measurable speedup here ({compile_run['Tokens/sec']} vs {baseline['Tokens/sec']}). "
-            "Small models often spend more time in Python overhead and compilation warmup than saved compute."
+            f"- **torch.compile** showed no measurable speedup "
+            f"({compile_run['Tokens/sec']} vs {baseline['Tokens/sec']}).\n"
+            "- Also measured pre-fusion, and with a `.item()` call inside the gradient "
+            "accumulation loop that forced a graph break on every micro-step. Inductor "
+            "had little contiguous graph to work with. Both are fixed; this needs re-running."
         )
 
     lr_runs = [by_name[k] for k in ("batch128_scaled_lr", "batch256_scaled_lr") if k in by_name]
@@ -273,7 +336,8 @@ def build_findings(rows):
         ]
         for run in lr_runs:
             lines.append(
-                f"- **{run['Run Name']}**: lr scaled to match batch, val loss {run['Val Loss']}, {run['Tokens/sec']} tok/s."
+                f"- **{run['Run Name']}**: lr scaled to match batch, best val loss "
+                f"{run['Best Val Loss']}, {run['Tokens/sec']} tok/s."
             )
         sections.append("\n".join(lines))
     elif any(k in by_name for k in ("batch128_scaled_lr", "batch256_scaled_lr")) is False:
@@ -288,57 +352,106 @@ def build_findings(rows):
         sections.insert(
             0,
             "### Smoke test\n"
-            f"- Quick sanity check on CPU: {smoke['Tokens/sec']} tok/s, val loss {smoke['Val Loss']}. "
+            f"- Quick sanity check on {smoke['Device']}: {smoke['Tokens/sec']} tok/s, "
+            f"best val loss {smoke['Best Val Loss']}. "
             "Used to verify the training loop before GPU experiments.",
         )
 
     return "\n\n".join(sections)
 
 
-def main():
-    runs = glob.glob("outputs/*/train_log.csv")
+DISPLAY_COLS = [
+    "Run Name",
+    "Change",
+    "Device",
+    "Batch",
+    "Grad Accum",
+    "Eff Batch",
+    "Precision",
+    "Compile",
+    "Tokens/sec",
+    "Step Time (s)",
+    "Max Mem (GB)",
+    "Best Val Loss",
+    "Best @ Step",
+    "Final Val Loss",
+]
 
-    if not runs:
-        print("No runs found under outputs/. Run experiments first with train.py or run_experiments.sh.")
-        return
 
+def build_report(runs):
     rows = [summarize_run(run) for run in runs]
     rows.sort(key=lambda r: (r["_sort_key"], r["run_name"]))
 
-    display_cols = [
-        "Run Name",
-        "Change",
-        "Batch",
-        "Grad Accum",
-        "Eff Batch",
-        "Precision",
-        "Compile",
-        "Tokens/sec",
-        "Step Time (s)",
-        "Max Mem (GB)",
-        "Val Loss",
-    ]
-    summary_df = pd.DataFrame(rows)[display_cols]
-    markdown_table = dataframe_to_markdown(summary_df)
-    findings = build_findings(rows)
-
-    output = "\n".join(
+    summary_df = pd.DataFrame(rows)[DISPLAY_COLS]
+    return "\n".join(
         [
             "## Experiment Summary",
             "",
-            markdown_table,
+            dataframe_to_markdown(summary_df),
             "",
             "## Findings",
             "",
-            findings,
+            build_findings(rows),
             "",
         ]
     )
 
-    print(output)
 
-    with open("experiment_summary.md", "w") as f:
-        f.write(output)
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Aggregate run logs into a markdown summary."
+    )
+    parser.add_argument(
+        "--runs",
+        default=["outputs/*/train_log.csv", "results/*/train_log.csv"],
+        nargs="+",
+        help="glob(s) matching train_log.csv files (default: outputs/ and results/)",
+    )
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="write the report to this file (default: print only)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="allow --out to overwrite an existing file",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+
+    runs = sorted({path for pattern in args.runs for path in glob.glob(pattern)})
+
+    if not runs:
+        print(
+            f"No runs found matching {args.runs}. "
+            "Run experiments first with train.py or run_experiments.sh."
+        )
+        return
+
+    report = build_report(runs)
+    print(report)
+
+    if args.out is None:
+        return
+
+    # Writing used to be unconditional, straight over experiment_summary.md.
+    # That file is the only surviving record of nine GPU runs whose CSVs are
+    # gone, so a single `python summarize.py` on a machine with one smoke test
+    # in outputs/ would have destroyed it.
+    out_path = Path(args.out)
+    if out_path.exists() and not args.force:
+        print(
+            f"\nRefusing to overwrite existing {out_path} ({len(runs)} run(s) found). "
+            "Pass --force if that is what you want."
+        )
+        return
+
+    out_path.write_text(report)
+    print(f"\nWrote {out_path} from {len(runs)} run(s).")
 
 
 if __name__ == "__main__":
