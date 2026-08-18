@@ -1,6 +1,17 @@
 # tiny-transformer
 
-A small decoder-only transformer trained on character-level Shakespeare text (`input.txt`) to study how systems-level choices (batch size, memory, kernel efficiency) interact with optimization behavior (validation loss, convergence).
+A small decoder-only transformer trained on character-level Shakespeare text
+(`input.txt`) to study how systems-level choices (batch size, memory, kernel
+efficiency) interact with optimization behavior (validation loss, convergence).
+
+> **On the benchmark numbers in this repo.** The results table was measured on a
+> rented GPU that is no longer accessible, and the hardware was never recorded
+> alongside the runs. It was also measured before the attention and timing bugs
+> described in [experiment_summary.md](experiment_summary.md) were fixed. The
+> loss figures are still valid; the throughput and memory figures need
+> re-running on CUDA hardware. Runs made from now on write a `run_info.json`
+> recording the device, torch version and CUDA version next to the log, so this
+> gap does not recur.
 
 ## Setup
 
@@ -9,6 +20,9 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+`requirements.txt` pins the versions this repo was developed against. On a CUDA
+machine, install torch from the matching index rather than the default wheel.
 
 ## Running experiments
 
@@ -26,77 +40,150 @@ Run all configs sequentially (logs to `logs/`):
 bash run_experiments.sh
 ```
 
-Each run writes checkpoints and a CSV log to `outputs/<run_name>_<config>_<timestamp>/`. Summarize all completed runs:
+Each run writes checkpoints, a CSV log and a `run_info.json` to
+`outputs/<run_name>_<config>_<timestamp>/`.
+
+Override the device (defaults to CUDA when available, else CPU):
 
 ```bash
-python summarize.py
+python train.py --config smoke_test --device mps
 ```
+
+Summarize completed runs:
+
+```bash
+python summarize.py                                  # print a report
+python summarize.py --out experiment_summary.md      # write it (refuses to clobber)
+```
+
+`summarize.py` prints by default and only writes with `--out`. It will not
+overwrite an existing file without `--force`, because `experiment_summary.md` is
+the only surviving record of several runs whose CSVs are gone.
+
+## Tests
+
+```bash
+pytest
+```
+
+34 CPU-only tests, ~3 seconds. The important ones:
+
+| Test | What it pins down |
+| --- | --- |
+| `test_attention_equivalence.py` | Fused attention is numerically identical to the original per-head loop, on both the SDPA and manual paths, forward and backward |
+| `test_training_parity.py` | 30 optimizer steps from identical weights produce the same loss curve either way |
+| `test_train.py::test_gradient_accumulation_matches_one_large_batch` | N accumulated micro-batches give the same gradient as one batch of N x the size |
+| `test_model.py::test_overfits_a_single_fixed_batch` | The loop can drive loss down on a memorised batch — the cheapest end-to-end signal that forward, backward, optimizer and target alignment agree |
+
+`tests/reference_attention.py` is a frozen copy of the pre-refactor attention
+implementation. It exists only so the equivalence proof stays runnable; it is
+deliberately not modernised.
 
 ## Model and training defaults
 
 | Setting | Value |
 | --- | --- |
-| Architecture | 6-layer decoder, 384-dim, 6 heads |
+| Architecture | 6-layer decoder, 384-dim, 6 heads (10.79M params) |
 | Context length | 256 characters |
 | Optimizer | AdamW, lr = 3e-4 |
 | Training steps | 5,000 |
 | Data split | 90% train / 10% val |
+| Normalization | post-LayerNorm (see below) |
 
-The baseline config is `configs/base.yaml`. Other configs vary one axis at a time: batch size, gradient accumulation, mixed precision, flash attention, or `torch.compile`.
+The baseline config is `configs/base.yaml`. Other configs vary one axis at a
+time: batch size, gradient accumulation, mixed precision, flash attention, or
+`torch.compile`.
 
-## Experiment results
+### Attention
 
-Full metrics table and auto-generated analysis: [experiment_summary.md](experiment_summary.md).
+Multi-head attention uses a single `nn.Linear(n_embd, 3 * n_embd)` producing Q,
+K and V in one GEMM, reshaped to `(B, n_heads, T, head_size)`, followed by one
+batched attention call per layer.
 
-### Baseline (batch 64, fp32)
+An earlier version held an `nn.ModuleList` of `n_heads` separate head modules,
+each with its own Q/K/V projection, and looped over them in Python. At the base
+config that meant 108 small GEMMs and 36 attention calls per forward pass. The
+two are mathematically identical — see the test table above — but the looped
+version spent most of its time on per-operation overhead rather than arithmetic,
+which is the most likely reason flash attention, bf16 and `torch.compile` all
+measured as no-ops.
 
-Reference point for all comparisons: **291k tokens/sec**, **3.6 GB** peak memory, validation loss **1.6111** after 5k steps.
+`use_flash_attention: False` switches to an explicit
+matmul → mask → softmax → matmul implementation. Both paths compute the same
+thing (asserted in the tests), so the flag is a fair A/B comparison of kernels.
 
-### Batch size sweep
+### Pre-norm vs post-norm
 
-| Config | Batch | Throughput | Memory | Val Loss | Takeaway |
-| --- | --- | --- | --- | --- | --- |
-| batch32 | 32 | 227k | 1.9 GB | **1.5159** | Best validation loss; ~half the memory of baseline |
-| baseline | 64 | 291k | 3.6 GB | 1.6111 | Best balance of speed and quality |
-| batch128 | 128 | 275k | 7.0 GB | 1.8073 | Slightly faster per step but worse loss without LR scaling |
-| batch256 | 256 | 240k | 13.9 GB | 2.0223 | Highest memory, worst loss — large-batch penalty |
+`DecoderBlock` defaults to **post-LayerNorm**, the original "Attention Is All
+You Need" arrangement:
 
-**Finding:** Throughput does not scale linearly with batch size on this model; training is memory-bandwidth limited. Smaller batches produce noisier gradients that generalize better on this small dataset, while very large batches degrade validation loss unless learning rate is scaled.
+```python
+x = self.ln1(x + self.mhsa(x, is_causal=True))
+x = self.ln2(x + self.ff(x))
+```
 
-### Gradient accumulation
+GPT-2 and nanoGPT use **pre-LayerNorm**, where the normalization moves inside
+the residual branch:
 
-Both configs target an effective batch of 64:
+```python
+x = x + self.mhsa(self.ln1(x))
+x = x + self.ff(self.ln2(x))
+```
 
-| Config | Micro-batch | Accum steps | Throughput | Memory | Val Loss |
-| --- | --- | --- | --- | --- | --- |
-| grad_accum32x2 | 32 | 2 | 245k | 1.9 GB | 1.6044 |
-| grad_accum16x4 | 16 | 4 | 124k | 1.1 GB | 1.6227 |
+The difference matters because pre-norm leaves an unnormalized path from input
+to output. Every residual branch adds into a stream that is never rescaled, so
+gradients reach early layers without passing through a LayerNorm each time. That
+is what makes deep transformers trainable without a long learning-rate warmup;
+post-norm models get progressively harder to train as depth grows. At 6 layers
+either works, which is why the original choice was never a problem here.
 
-**Finding:** 2× accumulation recovers near-baseline speed and loss at half the memory. 4× accumulation minimizes memory but cuts throughput in half — useful only when memory is the hard constraint.
+Set `norm_first: True` in a config to use pre-norm. The default stays post-norm
+so the existing results table remains a valid comparison — switching it would
+silently invalidate every number in it.
 
-### Mixed precision (BF16)
+## Reproducibility
 
-Identical to baseline on throughput, memory, and validation loss. Enable with `mixed_precision: True` and `dtype: bf16` in config — no accuracy trade-off observed at this scale.
-
-### Flash attention
-
-293k vs 291k tokens/sec — effectively no change. At 256 context length and 384 embedding dim, the manual attention path is already fast enough that fused kernels do not matter much.
-
-### torch.compile
-
-No measurable speedup (291k vs 291k). Compilation overhead and Python dispatch dominate for a ~10M parameter model.
-
-### LR scaling (not yet run)
-
-Configs `batch128_scaled_lr` and `batch256_scaled_lr` apply the linear scaling rule (lr × batch/64). These are set up to test whether scaled LR recovers the validation loss gap seen in the unscaled large-batch runs.
+- `seed` (default 1337) seeds torch, numpy and `random`.
+- `deterministic: True` additionally selects deterministic kernels, at some cost
+  in throughput.
+- `timing_warmup_steps` (default 5) excludes the first steps of a run from the
+  rolling throughput average, so allocator warmup and `torch.compile`
+  compilation do not contaminate it. Runs shorter than the warmup report `nan`
+  rather than a number that would be wrong.
+- Step timing calls `torch.cuda.synchronize()` / `torch.mps.synchronize()`
+  before reading the clock. Without it the timer measures how long it took to
+  queue the work, not to do it.
 
 ## Project layout
 
 ```
 configs/          experiment configs grouped by axis (batch/, attention/, mp/, etc.)
-train.py          training loop with logging and checkpointing
+train.py          training loop with logging, checkpointing and provenance
 model.py          decoder-only transformer
-summarize.py      aggregate outputs/*/train_log.csv into experiment_summary.md
-dataset.py        optional FineWeb-Edu tokenization script (not used by train.py yet)
+summarize.py      aggregate run logs into a markdown report
+utils.py          config loading and validation
+tests/            pytest suite (CPU-only, ~3s)
+scripts/          bench_attention.py, prepare_fineweb.py (not wired into training)
+results/          committed run artifacts, see results/README.md
+outputs/          scratch dir for new runs (gitignored)
 input.txt         Shakespeare character-level corpus
 ```
+
+## Experiment results
+
+Full table, corrections and the list of what still needs re-measuring:
+[experiment_summary.md](experiment_summary.md). Committed raw artifacts and
+their caveats: [results/README.md](results/README.md).
+
+Summary of where things stand:
+
+- **Loss and convergence results are valid.** The attention refactor is proven
+  numerically equivalent, so nothing about optimization behaviour changed.
+- **Throughput and memory results are stale.** They were measured with the
+  looped attention and an unsynchronized timer, on unrecorded hardware.
+- **The batch-size conclusion needs re-examining.** Every run is scored at step
+  5000, but the one surviving CSV shows validation loss bottoming out at 1.4986
+  around step 2500 and rising to 1.6111 by the end. The sweep may be measuring
+  overfitting rate rather than generalization.
+- **The bf16 and torch.compile rows are identical to baseline in every column**,
+  including peak memory, which bf16 should have changed. Treat both as unverified.
