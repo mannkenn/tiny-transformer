@@ -4,14 +4,16 @@ A small decoder-only transformer trained on character-level Shakespeare text
 (`input.txt`) to study how systems-level choices (batch size, memory, kernel
 efficiency) interact with optimization behavior (validation loss, convergence).
 
-> **On the benchmark numbers in this repo.** The results table was measured on a
-> rented GPU that is no longer accessible, and the hardware was never recorded
-> alongside the runs. It was also measured before the attention and timing bugs
-> described in [experiment_summary.md](experiment_summary.md) were fixed. The
-> loss figures are still valid; the throughput and memory figures need
-> re-running on CUDA hardware. Runs made from now on write a `run_info.json`
-> recording the device, torch version and CUDA version next to the log, so this
-> gap does not recur.
+> **On the benchmark numbers in this repo.** Two rows of the results table —
+> `mp_bf16` and `torch_compile` — are **invalid**: a config-parsing bug meant
+> those settings were discarded before `train.py` saw them, so both ran as
+> repeats of the baseline. bf16 and `torch.compile` have never actually been
+> measured on this model. The flash attention and gradient accumulation rows are
+> unaffected. Everything else was measured on a rented GPU that is no longer
+> accessible, on hardware that was never recorded, and before the attention and
+> timing bugs were fixed — loss figures remain valid, throughput and memory need
+> re-running on CUDA. Full accounting in
+> [experiment_summary.md](experiment_summary.md).
 
 ## Setup
 
@@ -177,13 +179,20 @@ their caveats: [results/README.md](results/README.md).
 
 Summary of where things stand:
 
+- **Two experiments never ran.** `mp_bf16` executed in fp32 and `torch_compile`
+  never called `torch.compile`, because `parse_config` silently discarded config
+  keys it had not been taught about. Both were baseline repeats, which is why
+  three rows agree to four decimals. Nothing is known about bf16 or
+  `torch.compile` on this model — not that they help, not that they are free.
+- **Flash attention and gradient accumulation are unaffected.** Those keys were
+  parsed when the runs happened, so those rows measured what they claim.
 - **Loss and convergence results are valid.** The attention refactor is proven
   numerically equivalent, so nothing about optimization behaviour changed.
 - **Throughput and memory results are stale.** They were measured with the
   looped attention and an unsynchronized timer, on unrecorded hardware.
-- **The batch-size conclusion needs re-examining.** Every run is scored at step
-  5000, but the one surviving CSV shows validation loss bottoming out at 1.4986
-  around step 2500 and rising to 1.6111 by the end. The sweep may be measuring
-  overfitting rate rather than generalization.
-- **The bf16 and torch.compile rows are identical to baseline in every column**,
-  including peak memory, which bf16 should have changed. Treat both as unverified.
+- **The batch-size conclusion is confounded, and the ranking inverts.** Every run
+  is scored at step 5000, but the surviving CSV shows validation loss bottoming
+  out at **1.4986 at step 2500** and rising to 1.6111 by the end. The baseline's
+  best beats Batch32's reported 1.5159, so "smaller batches generalize better"
+  cannot be distinguished from "smaller batches overfit more slowly". The other
+  runs' CSVs are gone, so no corrected ranking can be computed.

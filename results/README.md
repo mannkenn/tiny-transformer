@@ -69,6 +69,20 @@ sweep's headline finding (smaller batch = better validation loss): smaller
 batches are noisier and overfit a small corpus more slowly. Scoring each run at
 its own best validation loss, or adding early stopping, would test that.
 
+## Two of the summary table's rows are invalid
+
+Separately from everything above: the `mp_bf16` and `torch_compile` rows of the
+results table do not measure what they name. `parse_config` silently dropped any
+YAML key it had not been taught about, and it did not learn `mixed_precision`,
+`dtype` or `torch_compile` until `ddbbf2c` (2026-05-25), three weeks after the
+runs. Both experiments therefore executed as byte-identical repeats of the
+baseline config. `use_flash_attention` and `grad_accum_steps` *were* parsed by
+then, so those rows are genuine. Full evidence in `experiment_summary.md`.
+
+Runs written from now on record `mixed_precision_active` and
+`torch_compile_active` in `run_info.json`, separately from what the config
+requested, so a run artifact states what actually happened.
+
 ## Re-running
 
 Every throughput and memory number in this repo predates the attention fusion

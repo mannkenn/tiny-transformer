@@ -241,6 +241,11 @@ def summarize_run(csv_path):
         "_sort_key": RUN_ORDER.get(run_name, 99),
         "_tokens_per_sec_raw": steady_df["tokens_per_sec"].mean(),
         "_last_step": int(final_row["step"]),
+        # None means "the run predates provenance logging", which is not the
+        # same as False and must not be reported as though it were.
+        "_mixed_precision_active": (info or {}).get("mixed_precision_active"),
+        "_mixed_precision_status": (info or {}).get("mixed_precision_status"),
+        "_torch_compile_active": (info or {}).get("torch_compile_active"),
     }
 
 
@@ -347,15 +352,27 @@ def build_findings(rows):
 
     mp_run = by_name.get("mp_bf16")
     if mp_run and baseline:
-        sections.append(
-            "### Mixed precision (BF16)\n"
-            f"- **BF16** measured the same as baseline on throughput ({mp_run['Tokens/sec']}), "
-            f"memory ({mp_run['Max Mem (GB)']} GB) and validation loss "
-            f"({mp_run['Best Val Loss']}).\n"
-            "- A null result this exact is itself suspicious: bf16 halves activation "
-            "bytes, so peak memory should have moved even if speed did not. Before "
-            "concluding 'bf16 is free', confirm autocast was actually active in the run."
-        )
+        if mp_run["_mixed_precision_active"] is False:
+            # Refuse to describe a fp32 run as a mixed-precision result. This is
+            # the exact reporting failure that published "bf16 is free".
+            sections.append(
+                "### Mixed precision (BF16)\n"
+                "- **This run did not use mixed precision.** Its `run_info.json` records "
+                f"`mixed_precision_active: false` ({mp_run['_mixed_precision_status']}), "
+                "so its numbers describe an fp32 run and say nothing about bf16.\n"
+                "- No conclusion is drawn. Re-run on a device where autocast is active."
+            )
+        else:
+            sections.append(
+                "### Mixed precision (BF16)\n"
+                f"- **BF16** measured {mp_run['Tokens/sec']} tok/s, "
+                f"{mp_run['Max Mem (GB)']} GB, best val loss {mp_run['Best Val Loss']}, "
+                f"against a baseline of {baseline['Tokens/sec']} tok/s, "
+                f"{baseline['Max Mem (GB)']} GB, {baseline['Best Val Loss']}.\n"
+                "- Sanity check before drawing a conclusion: bf16 halves activation bytes, "
+                "so peak memory should differ from the fp32 baseline. If it does not, "
+                "suspect the measurement rather than reporting a null result."
+            )
 
     flash_run = by_name.get("flash_att")
     if flash_run and baseline:
@@ -372,14 +389,22 @@ def build_findings(rows):
 
     compile_run = by_name.get("torch_compile")
     if compile_run and baseline:
-        sections.append(
-            "### torch.compile\n"
-            f"- **torch.compile** showed no measurable speedup "
-            f"({compile_run['Tokens/sec']} vs {baseline['Tokens/sec']}).\n"
-            "- Also measured pre-fusion, and with a `.item()` call inside the gradient "
-            "accumulation loop that forced a graph break on every micro-step. Inductor "
-            "had little contiguous graph to work with. Both are fixed; this needs re-running."
-        )
+        if compile_run["_torch_compile_active"] is False:
+            sections.append(
+                "### torch.compile\n"
+                "- **This run never called `torch.compile`.** Its `run_info.json` records "
+                "`torch_compile_active: false`, so its numbers describe an eager run.\n"
+                "- No conclusion is drawn."
+            )
+        else:
+            sections.append(
+                "### torch.compile\n"
+                f"- **torch.compile** measured {compile_run['Tokens/sec']} tok/s against "
+                f"a baseline of {baseline['Tokens/sec']} tok/s.\n"
+                "- Check that compilation warmup is excluded from the average before "
+                "reading this: a compiled first step can cost thousands of times a "
+                "steady-state step."
+            )
 
     lr_runs = [by_name[k] for k in ("batch128_scaled_lr", "batch256_scaled_lr") if k in by_name]
     if lr_runs:
