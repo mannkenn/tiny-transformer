@@ -88,14 +88,31 @@ def device_description(device):
     return f"CPU ({platform.processor() or platform.machine()})"
 
 
-def write_run_info(out_dir, cfg, device):
+def write_run_info(
+    out_dir,
+    cfg,
+    device,
+    mixed_precision_active=None,
+    mixed_precision_status=None,
+    torch_compile_active=None,
+):
     """Record what hardware and software produced a run, next to its results.
 
     Benchmark numbers are meaningless without this. Any claim about throughput
     or memory should be traceable to the device string written here.
+
+    The *_active fields record what the run actually did, as distinct from what
+    its config asked for. Had these existed in May, the mp_bf16 and
+    torch_compile runs would have been self-evidently fp32 and uncompiled
+    instead of being written up as null results.
     """
     info = {
         "timestamp": datetime.now().astimezone().isoformat(),
+        "mixed_precision_requested": cfg["mixed_precision"],
+        "mixed_precision_active": mixed_precision_active,
+        "mixed_precision_status": mixed_precision_status,
+        "torch_compile_requested": cfg["torch_compile"],
+        "torch_compile_active": torch_compile_active,
         "device_type": device.type,
         "device_name": device_description(device),
         "torch_version": torch.__version__,
@@ -276,27 +293,86 @@ def build_model(cfg, vocab_size, device):
         norm_first=cfg["norm_first"],
     ).to(device)
 
-    if cfg.get("torch_compile", False):
+    # Direct indexing, not cfg.get(). parse_config guarantees the key exists, so
+    # a missing one should raise rather than default to "feature off" -- that
+    # default is what silently turned the torch_compile experiment into a
+    # baseline rerun.
+    compiled = cfg["torch_compile"]
+    if compiled:
         print("compiling model with torch.compile...")
         model = torch.compile(model)
 
-    return model
+    return model, compiled
+
+
+def resolve_amp(cfg, device):
+    """Decide whether autocast will actually be active, and say so out loud.
+
+    Returns (enabled, dtype, reason). `enabled` is what really happens, not what
+    the config asked for.
+    """
+    dtype = dtype_map[cfg["dtype"]]  # parse_config restricts this to bf16/fp16
+
+    if not cfg["mixed_precision"]:
+        return False, dtype, "not requested"
+
+    if device.type != "cuda":
+        # A refusal the operator can see, rather than a silently fp32 run that
+        # later gets written up as "bf16 was free".
+        print(
+            f"WARNING: mixed_precision=True but device is {device.type}; autocast is "
+            "CUDA-only in this project, so this run is fp32. Any bf16 claim from it "
+            "would be false."
+        )
+        return False, dtype, f"requested but unsupported on {device.type}"
+
+    return True, dtype, "active"
+
+
+def verify_autocast(model, cfg, device, amp_dtype):
+    """Prove autocast is really casting before trusting a mixed-precision run.
+
+    The bf16 experiment reported identical peak memory to the fp32 baseline,
+    which should have been the tell that nothing was being cast. One forward
+    pass settles it.
+    """
+    idx = torch.zeros((1, min(8, cfg["block_size"])), dtype=torch.long, device=device)
+    with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=True):
+        with torch.no_grad():
+            logits, _ = model(idx)
+
+    if logits.dtype != amp_dtype:
+        raise RuntimeError(
+            f"mixed_precision requested with dtype={amp_dtype}, but a forward pass "
+            f"under autocast produced {logits.dtype} logits. Autocast is not taking "
+            "effect; refusing to run and report this as a mixed-precision result."
+        )
+    print(f"autocast verified: logits are {logits.dtype} under autocast")
 
 
 def train(cfg, out_dir, log_path, resume=None, data_path="input.txt"):
     set_seed(cfg["seed"], cfg["deterministic"])
 
     device = resolve_device(cfg["device"])
-    write_run_info(out_dir, cfg, device)
 
-    # mixed precision: autocast is only wired up for cuda in this project
-    use_amp = cfg.get("mixed_precision", False) and device.type == "cuda"
-    if cfg.get("mixed_precision", False) and not use_amp:
-        print(f"warning: mixed_precision requested but device is {device.type}; running fp32")
-    amp_dtype = dtype_map.get(cfg.get("dtype", "bf16"), torch.bfloat16)
+    use_amp, amp_dtype, amp_reason = resolve_amp(cfg, device)
 
     train_data, val_data, vocab_size = load_data(data_path)
-    model = build_model(cfg, vocab_size, device)
+    model, compiled = build_model(cfg, vocab_size, device)
+
+    if use_amp:
+        verify_autocast(model, cfg, device, amp_dtype)
+
+    # Written after the model is built so it can record what was actually
+    # switched on, not merely what the config asked for.
+    write_run_info(
+        out_dir,
+        cfg,
+        device,
+        mixed_precision_active=use_amp,
+        mixed_precision_status=amp_reason,
+        torch_compile_active=compiled,
+    )
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()

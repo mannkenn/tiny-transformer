@@ -150,12 +150,38 @@ def describe_change(cfg):
     return ", ".join(parts) if parts else "config variant"
 
 
-def precision_label(cfg):
+def precision_label(cfg, info=None):
+    """Report the precision the run actually used, not the one it requested.
+
+    When run_info.json records that autocast was requested but inactive, say so
+    in the table. A row reading plain "bf16" for a run that executed in fp32 is
+    how the mp_bf16 result got published as a null finding.
+    """
     if cfg is None:
         return ""
-    if cfg.get("mixed_precision"):
-        return cfg.get("dtype", "bf16")
+
+    requested = cfg["mixed_precision"]
+    active = info.get("mixed_precision_active") if info else None
+
+    if active is False and requested:
+        return f"fp32 ({cfg['dtype']} requested, INACTIVE)"
+    if active or (active is None and requested):
+        return cfg["dtype"]
     return "fp32"
+
+
+def compile_label(cfg, info=None):
+    if cfg is None:
+        return ""
+
+    requested = cfg["torch_compile"]
+    active = info.get("torch_compile_active") if info else None
+
+    if active is False and requested:
+        return "no (requested, INACTIVE)"
+    if active or (active is None and requested):
+        return "yes"
+    return "no"
 
 
 def summarize_run(csv_path):
@@ -201,8 +227,8 @@ def summarize_run(csv_path):
         "Batch": cfg["batch_size"] if cfg else "",
         "Grad Accum": cfg["grad_accum_steps"] if cfg else "",
         "Eff Batch": cfg["effective_batch_size"] if cfg else "",
-        "Precision": precision_label(cfg),
-        "Compile": "yes" if cfg and cfg.get("torch_compile") else "no",
+        "Precision": precision_label(cfg, info),
+        "Compile": compile_label(cfg, info),
         "Tokens/sec": format_tokens(steady_df["tokens_per_sec"].mean()),
         "Step Time (s)": round(steady_df["step_time"].mean(), 4),
         "Max Mem (GB)": round(df["max_allocated_gb"].max(), 3)
@@ -214,6 +240,7 @@ def summarize_run(csv_path):
         "category": CATEGORY_MAP.get(run_name, "Other"),
         "_sort_key": RUN_ORDER.get(run_name, 99),
         "_tokens_per_sec_raw": steady_df["tokens_per_sec"].mean(),
+        "_last_step": int(final_row["step"]),
     }
 
 
@@ -243,8 +270,15 @@ def build_findings(rows):
             f"- Device: **{baseline['Device']}**.\n"
             f"- Throughput: **{baseline['Tokens/sec']} tokens/sec** at batch 64, fp32, manual attention.\n"
             f"{mem_line}"
-            f"- Validation loss: **{baseline['Best Val Loss']}** at step "
-            f"{baseline['Best @ Step']} (best), **{baseline['Final Val Loss']}** at the final step."
+            f"- Validation loss: **{baseline['Best Val Loss']}** (best, at step "
+            f"{baseline['Best @ Step']}). Final step: {baseline['Final Val Loss']}."
+            + (
+                f"\n- Validation loss bottomed out at step {baseline['Best @ Step']} of "
+                f"{baseline['_last_step']} and rose afterwards, so the final-step figure "
+                "measures the run past its own optimum. Best-val is the primary metric here."
+                if baseline["Best @ Step"] < baseline["_last_step"]
+                else ""
+            )
         )
 
     batch_runs = [by_name[k] for k in ("batch32", "batch128", "batch256") if k in by_name]
@@ -273,6 +307,25 @@ def build_findings(rows):
             f"(best val loss {best['Best Val Loss']}). "
             f"Fastest among batch variants: **{fastest['Run Name']}** ({fastest['Tokens/sec']} tok/s)."
         )
+
+        # Ranking on the final step is only meaningful if the runs are still
+        # improving there. Say so with the runs' own numbers rather than
+        # asserting a conclusion the data may not support.
+        overfit = [r for r in [baseline, *batch_runs] if r["Best @ Step"] < r["_last_step"]]
+        if overfit:
+            lines.append(
+                "- **Caution: this ranking may be confounded.** "
+                + ", ".join(
+                    f"{r['Run Name']} peaked at step {r['Best @ Step']} of {r['_last_step']} "
+                    f"({r['Best Val Loss']} -> {r['Final Val Loss']})"
+                    for r in overfit
+                )
+                + ". Runs scored after their own optimum are being ranked by how fast they "
+                "overfit, not by how well they generalize. Smaller batches are noisier and "
+                "overfit a 1.1 MB corpus more slowly, which produces the same ordering as "
+                "'smaller batches generalize better' and cannot be distinguished from it "
+                "without early stopping or best-val scoring."
+            )
         sections.append("\n".join(lines))
 
     grad_runs = [by_name[k] for k in ("grad_accum16x4", "grad_accum32x2") if k in by_name]
