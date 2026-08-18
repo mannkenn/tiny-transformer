@@ -1,0 +1,30 @@
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [".venv", "outputs", "archives"]
+
+[tool.ruff.lint]
+# Pinned explicitly rather than relying on ruff's defaults, which shift between
+# releases and would make CI results depend on the ruff version.
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # import sorting
+    "UP",  # pyupgrade
+    "B",   # bugbear
+    "C4",  # comprehensions
+]
+ignore = [
+    "E501",  # line length is handled by the formatter
+    "B905",  # zip(..., strict=) is noise for equal-length sequences here
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The frozen pre-refactor implementation must stay byte-identical to the
+# original so the equivalence proof means something.
+"tests/reference_attention.py" = ["ALL"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

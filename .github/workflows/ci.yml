@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        # CPU-only torch: the GPU wheel is ~2.5GB and nothing in the test suite
+        # needs CUDA.
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu torch==2.12.0
+          pip install -r requirements.txt
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        run: pytest -v
